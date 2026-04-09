@@ -11,11 +11,22 @@ import streamlit as st
 import cv2
 from PIL import Image
 
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    _HEIC_AVAILABLE = True
+except ImportError:
+    _HEIC_AVAILABLE = False
+
 
 DEFAULT_SCALE = 4
 DEFAULT_TILE = 0  # FSRCNNは軽量なため、既定はタイル分割なし
 MAX_PIXELS = 100_000_000  # 100MP
 TARGET_MAX_PIXELS = 99_000_000  # 99MPに収める（安全側）
+
+# アップスケール前の長辺上限（これを超える入力は先に縮小してメモリ負荷を抑える）
+PRE_UPSCALE_MAX_LONG_SIDE = 2000
 
 # --- Upscaler backend: OpenCV dnn_superres (FSRCNN x4) ---
 # pipで扱いやすいOpenCVの事前学習済みモデルを利用する。
@@ -47,6 +58,17 @@ def _composite_to_rgb(pil_img: Image.Image, bg: Tuple[int, int, int] = (255, 255
         return background
     # それ以外（例: L / P）をRGBへ
     return pil_img.convert("RGB")
+
+
+def downscale_before_upscale_if_needed(pil_img: Image.Image, max_long_side: int = PRE_UPSCALE_MAX_LONG_SIDE) -> Image.Image:
+    """
+    長辺が max_long_side を超える場合、アップスケール前に縮小する（メモリ不足対策）。
+    """
+    w, h = pil_img.size
+    current_long = max(w, h)
+    if current_long <= max_long_side:
+        return pil_img
+    return resize_by_long_side(pil_img, max_long_side)
 
 
 def resize_by_long_side(pil_img: Image.Image, long_side_px: int) -> Image.Image:
@@ -238,7 +260,18 @@ def upscale_4x(pil_img: Image.Image, tile: int = DEFAULT_TILE) -> Image.Image:
 
 def _image_bytes_to_pil(uploaded_file) -> Image.Image:
     uploaded_file.seek(0)
-    pil_img = Image.open(uploaded_file)
+    try:
+        pil_img = Image.open(uploaded_file)
+    except OSError as e:
+        name = getattr(uploaded_file, "name", "") or ""
+        if (name.lower().endswith((".heic", ".heif")) or getattr(uploaded_file, "type", "") in (
+            "image/heic",
+            "image/heif",
+        )) and not _HEIC_AVAILABLE:
+            raise OSError(
+                "HEIC/HEIF の読み込みには pillow-heif が必要です。requirements をインストールし直してください。"
+            ) from e
+        raise
     # Exif回転などが必要ならここで対応できるが、今回は最小構成で実装する
     return pil_img
 
@@ -253,10 +286,13 @@ def main():
     with st.sidebar:
         st.header("設定")
 
+        heic_types = ["heic", "heif"] if _HEIC_AVAILABLE else []
         uploaded = st.file_uploader(
             "画像をアップロード",
-            type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+            type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", *heic_types],
         )
+        if not _HEIC_AVAILABLE:
+            st.caption("HEIC は pillow-heif 未インストールのため選択できません。`pip install -r requirements.txt` を実行してください。")
 
         output_long_side = st.number_input(
             "出力: Long Side（px）",
@@ -286,7 +322,13 @@ def main():
         return
 
     # 入力プレビュー
-    input_pil = _image_bytes_to_pil(uploaded)
+    try:
+        input_pil = _image_bytes_to_pil(uploaded)
+    except OSError as e:
+        st.error("この画像は読み込めませんでしたニャ。形式を確認するか、別の画像を試してくださいニャ。")
+        st.caption(str(e))
+        return
+
     input_pil_rgb = _composite_to_rgb(input_pil)
     st.subheader("入力")
     col1, col2 = st.columns([1, 1])
@@ -295,20 +337,43 @@ def main():
     with col2:
         w, h = input_pil_rgb.size
         st.metric("入力ピクセル", f"{w} x {h}")
+        if max(w, h) > PRE_UPSCALE_MAX_LONG_SIDE:
+            st.caption(
+                f"長辺が {PRE_UPSCALE_MAX_LONG_SIDE}px を超えるため、アップスケール前に "
+                f"{PRE_UPSCALE_MAX_LONG_SIDE}px 相当に縮小してから処理します（メモリ節約ニャ）。"
+            )
 
     if not run:
         return
 
     # 処理開始
     start = time.time()
-    with st.spinner("4倍アップスケール中..."):
-        upscaled = upscale_4x(input_pil, tile=int(tile))
+    try:
+        to_upscale = downscale_before_upscale_if_needed(input_pil)
 
-    with st.spinner("PillowでLong Side指定に縮小中..."):
-        resized = resize_by_long_side(upscaled, int(output_long_side))
+        with st.spinner("4倍アップスケール中..."):
+            upscaled = upscale_4x(to_upscale, tile=int(tile))
 
-    # 保存前チェック（100MPガード）
-    resized = enforce_under_max_pixels(resized, st_module=st)
+        with st.spinner("PillowでLong Side指定に縮小中..."):
+            resized = resize_by_long_side(upscaled, int(output_long_side))
+
+        # 保存前チェック（100MPガード）
+        resized = enforce_under_max_pixels(resized, st_module=st)
+    except MemoryError:
+        st.error("この画像は大きすぎますニャ。もう少し小さい画像にするか、サイドバーの tile を大きめの値にして分割処理を試してくださいニャ。")
+        return
+    except cv2.error as e:
+        msg = str(e).lower()
+        if "memory" in msg or "alloc" in msg or "oom" in msg:
+            st.error("この画像は大きすぎますニャ。tile を上げるか、より小さい画像で試してくださいニャ。")
+        else:
+            st.error("画像の処理中にエラーが出ましたニャ。別の画像で試すか、設定を変えてくださいニャ。")
+        st.caption(str(e))
+        return
+    except Exception as e:
+        st.error("画像の処理中にエラーが出ましたニャ。サイズや形式を確認してくださいニャ。")
+        st.caption(str(e))
+        return
 
     # 出力プレビュー
     st.subheader("出力")
@@ -320,14 +385,22 @@ def main():
 
     # DL用バイト列
     buf = BytesIO()
-    if output_format == "png":
-        resized.save(buf, format="PNG")
-        mime = "image/png"
-        ext = "png"
-    else:
-        resized.save(buf, format="JPEG", quality=int(jpeg_quality), optimize=True)
-        mime = "image/jpeg"
-        ext = "jpg"
+    try:
+        if output_format == "png":
+            resized.save(buf, format="PNG")
+            mime = "image/png"
+            ext = "png"
+        else:
+            resized.save(buf, format="JPEG", quality=int(jpeg_quality), optimize=True)
+            mime = "image/jpeg"
+            ext = "jpg"
+    except MemoryError:
+        st.error("この画像は大きすぎますニャ。出力の Long Side を小さくするか、JPEG で保存してみてくださいニャ。")
+        return
+    except Exception as e:
+        st.error("保存用データの作成に失敗しましたニャ。")
+        st.caption(str(e))
+        return
 
     buf.seek(0)
     st.download_button(
