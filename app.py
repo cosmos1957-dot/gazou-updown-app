@@ -21,7 +21,8 @@ except ImportError:
 
 
 DEFAULT_SCALE = 4
-DEFAULT_TILE = 0  # FSRCNNは軽量なため、既定はタイル分割なし
+DEFAULT_TILE = 2  # 安定動作のため最小タイルは2（0/1は不可）
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # アップロード上限 10MB
 MAX_PIXELS = 100_000_000  # 100MP
 TARGET_MAX_PIXELS = 99_000_000  # 99MPに収める（安全側）
 
@@ -36,6 +37,18 @@ MODEL_URLS = [
     "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x4.pb",
     "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x4.pb",
 ]
+
+
+def _uploaded_file_byte_len(uploaded_file) -> int:
+    """Streamlit UploadedFile のバイト長（大きな read なしで取得できる場合はそれを使う）。"""
+    n = getattr(uploaded_file, "size", None)
+    if isinstance(n, int) and n >= 0:
+        return n
+    pos = uploaded_file.tell()
+    uploaded_file.seek(0, 2)
+    end = uploaded_file.tell()
+    uploaded_file.seek(pos)
+    return int(end)
 
 
 def _pillow_lanczos_resample() -> int:
@@ -208,11 +221,8 @@ def upscale_4x(pil_img: Image.Image, tile: int = DEFAULT_TILE) -> Image.Image:
     rgb_img = _composite_to_rgb(pil_img)
     bgr = pil_to_bgr_np(rgb_img)
 
-    # tile=0なら一括処理
-    tile_size = int(tile)
-    if tile_size <= 0:
-        out_bgr = sr.upsample(bgr)
-        return bgr_np_to_pil(out_bgr)
+    # 安定性のためタイル幅は最低2（UIと同じ前提）
+    tile_size = max(2, int(tile))
 
     # タイル分割でメモリ負荷を抑える（境界の継ぎ目対策にオーバーラップ）
     h, w = bgr.shape[:2]
@@ -291,6 +301,7 @@ def main():
             "画像をアップロード",
             type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", *heic_types],
         )
+        upload_too_large = uploaded is not None and _uploaded_file_byte_len(uploaded) > MAX_UPLOAD_BYTES
         if not _HEIC_AVAILABLE:
             st.caption("HEIC は pillow-heif 未インストールのため選択できません。`pip install -r requirements.txt` を実行してください。")
 
@@ -302,23 +313,33 @@ def main():
             step=1,
         )
 
-        # FSRCNNは軽量なので、既定はタイルなし（0）で高速処理を優先
         tile = st.number_input(
             "tile（必要時のみ分割）",
-            min_value=0,
+            min_value=2,
             max_value=8000,
             value=DEFAULT_TILE,
             step=1,
-            help="0でタイル処理なし（推奨）。メモリ不足時のみ大きめ値で分割してください。",
+            help="2以上でタイル分割（安定動作向け）。メモリ不足時は大きめの値で分割を細かくしてください。",
+        )
+        st.caption(
+            "安定動作のためにTileを2以上に設定しています。じっくり丁寧に描き上げるので、お茶でも飲んで待っててニャ☕"
         )
 
         output_format = st.selectbox("保存形式", options=["png", "jpeg"], index=0)
         jpeg_quality = st.slider("JPEG品質", min_value=10, max_value=95, value=92, step=1)
 
-        run = st.button("変換（4x → Long Side縮小）", type="primary", disabled=(uploaded is None))
+        run = st.button(
+            "変換（4x → Long Side縮小）",
+            type="primary",
+            disabled=(uploaded is None or upload_too_large),
+        )
 
     if uploaded is None:
         st.info("画像をアップロードすると、ここに入力プレビューが表示されます。")
+        return
+
+    if _uploaded_file_byte_len(uploaded) > MAX_UPLOAD_BYTES:
+        st.error("10MB以下の画像を選んでニャ🐾")
         return
 
     # 入力プレビュー
